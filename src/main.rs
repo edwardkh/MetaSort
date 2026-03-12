@@ -20,6 +20,19 @@ use fs_extra;
 use crate::platform::{is_exiftool_available, get_installation_instructions};
 use crate::ui::MetaSortUI;
 
+/// Clean a path string from terminal input.
+/// Terminals may wrap dragged paths in quotes or escape spaces with backslashes.
+/// On Windows, backslashes are path separators and should not be stripped.
+fn clean_input_path(s: &str) -> String {
+    // Strip surrounding single or double quotes
+    let s = s.trim_matches(|c| c == '\'' || c == '"');
+    if cfg!(windows) {
+        s.to_string()
+    } else {
+        s.replace("\\ ", " ")
+    }
+}
+
 fn get_folder_size(path: &str) -> u64 {
     walkdir::WalkDir::new(path)
         .into_iter()
@@ -58,10 +71,10 @@ fn main() {
     println!("\n📂 Please drag and drop your Google Photos Takeout folder here, or specify the folder path:");
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("Failed to read line");
-    let input_dir = input.trim();
+    let input_dir = clean_input_path(input.trim());
 
     // Calculate input folder size and prompt for required space
-    let folder_size = get_folder_size(input_dir);
+    let folder_size = get_folder_size(&input_dir);
     let required_space = folder_size * 3;
     MetaSortUI::print_info(&format!("Input folder size: {}", human_readable_size(folder_size)));
     MetaSortUI::print_info(&format!("Recommended free space: {}", human_readable_size(required_space)));
@@ -77,7 +90,7 @@ fn main() {
     println!("\n📁 Please specify the output folder where MetaSort should work (originals will be untouched):");
     let mut output = String::new();
     io::stdin().read_line(&mut output).expect("Failed to read line");
-    let output_dir = PathBuf::from(output.trim());
+    let output_dir = PathBuf::from(clean_input_path(output.trim()));
     let temp_dir = output_dir.join("MetaSort_temp");
 
     // Ask if WhatsApp/Screenshots should be separated (before processing begins)
@@ -108,7 +121,7 @@ fn main() {
     MetaSortUI::print_info("Copying input folder to working directory...");
     
     let mut ui = MetaSortUI::new();
-    let total_files = count_files_in_directory(input_dir);
+    let total_files = count_files_in_directory(&input_dir);
     ui.start_main_progress(total_files as u64, "Copying files");
     
     let mut copy_options = fs_extra::dir::CopyOptions::new();
