@@ -2,22 +2,18 @@
 // Embedding metadata logic for MetaSort_v1.0.0 – Google Photos Takeout Organizer 
 
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
 use crate::metadata_extraction::MediaMetadata;
 use crate::filename_date_guess::extract_date_from_filename;
 use crate::utils::log_to_file;
 use crate::platform::get_exiftool_command;
 
-pub fn embed_metadata_all(metadata_list: &[MediaMetadata], log_dir: &Path) {
+pub fn embed_metadata_all(metadata_list: &[MediaMetadata], log_dir: &Path, use_filename: bool) {
     let logs_dir = log_dir.join("logs");
     let log_path = logs_dir.join("metadata_embedding.log");
     let _ = fs::create_dir_all(&logs_dir);
     let _log_file = File::create(&log_path).expect("Failed to create log file");
-    println!("\n🧐Do you want to embed date/time for WhatsApp & Screenshot images based on their  \n1. Metadata\n2. Filename\n");
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).expect("Failed to read line");
-    let use_filename = matches!(input.trim(), "2");
     let total = metadata_list.len();
     let mut processed = 0;
     for meta in metadata_list {

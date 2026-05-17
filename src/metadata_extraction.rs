@@ -4,7 +4,6 @@ use walkdir::WalkDir;
 use serde_json::Value;
 use chrono::{TimeZone, Utc};
 use crate::utils::log_to_file;
-use std::io;
 use std::io::Write;
 use crate::filename_date_guess::extract_date_from_filename;
 
@@ -20,7 +19,7 @@ pub struct MediaMetadata {
     pub camera_model: Option<String>,
 }
 
-pub fn extract_metadata(base_path: &str) -> (Vec<MediaMetadata>, Vec<PathBuf>) {
+pub fn extract_metadata(base_path: &str, guess_dates: bool) -> (Vec<MediaMetadata>, Vec<PathBuf>) {
     let mut media_json_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut all_media_files: Vec<PathBuf> = Vec::new();
     let media_extensions = vec![
@@ -110,16 +109,20 @@ pub fn extract_metadata(base_path: &str) -> (Vec<MediaMetadata>, Vec<PathBuf>) {
     }
     // Handle unpaired media
     if !unpaired_media.is_empty() {
+        let total_files = paired_media.len() + unpaired_media.len();
+        let pct = (unpaired_media.len() * 100) / total_files;
         println!(
-            "\n⚠️  No .json found for {} out of {} files ({}%).\nWhat should MetaSort do?\n1. Skip and move to 'Unknown Time'\n2. Try to guess timestamp from filename\nEnter 1 or 2:",
-            unpaired_media.len(), paired_media.len() + unpaired_media.len(), (unpaired_media.len() * 100) / (paired_media.len() + unpaired_media.len())
+            "\n⚠️  No .json found for {} out of {} files ({}%).",
+            unpaired_media.len(), total_files, pct
         );
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let guess = input.trim() == "2";
+        if guess_dates {
+            println!("Attempting to guess timestamps from filenames...");
+        } else {
+            println!("Moving these files to 'Unknown Time'.");
+        }
         for media_path in unpaired_media {
             let filename = media_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let exif_date = if guess {
+            let exif_date = if guess_dates {
                 if let Some(date) = extract_date_from_filename(filename) {
                     log_to_file(&logs_dir, "metadata_extraction.log", &format!("Guessed date from filename for {:?}: {}", filename, date));
                     Some(date)

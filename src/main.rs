@@ -20,6 +20,19 @@ use fs_extra;
 use crate::platform::{is_exiftool_available, get_installation_instructions};
 use crate::ui::MetaSortUI;
 
+/// Clean a path string from terminal input.
+/// Terminals may wrap dragged paths in quotes or escape spaces with backslashes.
+/// On Windows, backslashes are path separators and should not be stripped.
+fn clean_input_path(s: &str) -> String {
+    // Strip surrounding single or double quotes
+    let s = s.trim_matches(|c| c == '\'' || c == '"');
+    if cfg!(windows) {
+        s.to_string()
+    } else {
+        s.replace("\\ ", " ")
+    }
+}
+
 fn get_folder_size(path: &str) -> u64 {
     walkdir::WalkDir::new(path)
         .into_iter()
@@ -58,10 +71,10 @@ fn main() {
     println!("\n📂 Please drag and drop your Google Photos Takeout folder here, or specify the folder path:");
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("Failed to read line");
-    let input_dir = input.trim();
+    let input_dir = clean_input_path(input.trim());
 
     // Calculate input folder size and prompt for required space
-    let folder_size = get_folder_size(input_dir);
+    let folder_size = get_folder_size(&input_dir);
     let required_space = folder_size * 3;
     MetaSortUI::print_info(&format!("Input folder size: {}", human_readable_size(folder_size)));
     MetaSortUI::print_info(&format!("Recommended free space: {}", human_readable_size(required_space)));
@@ -77,15 +90,38 @@ fn main() {
     println!("\n📁 Please specify the output folder where MetaSort should work (originals will be untouched):");
     let mut output = String::new();
     io::stdin().read_line(&mut output).expect("Failed to read line");
-    let output_dir = PathBuf::from(output.trim());
+    let output_dir = PathBuf::from(clean_input_path(output.trim()));
     let temp_dir = output_dir.join("MetaSort_temp");
+
+    // Ask if WhatsApp/Screenshots should be separated (before processing begins)
+    println!("\nDo you want to separate WhatsApp and Screenshot images? (y/n)");
+    let mut wa_sc_input = String::new();
+    io::stdin().read_line(&mut wa_sc_input).expect("Failed to read line");
+    let separate_wa_sc = matches!(wa_sc_input.trim().to_lowercase().as_str(), "y" | "yes");
+    if separate_wa_sc {
+        MetaSortUI::print_success("WhatsApp and Screenshot images will be sorted into their own folders by year/month.");
+    } else {
+        MetaSortUI::print_info("WhatsApp and Screenshot images will be treated as regular photos.");
+    }
+
+    // Ask how to embed date/time for WhatsApp & Screenshot images
+    println!("\nEmbed date/time for WhatsApp & Screenshot images based on their:\n1. Metadata\n2. Filename");
+    let mut embed_input = String::new();
+    io::stdin().read_line(&mut embed_input).expect("Failed to read line");
+    let use_filename_date = matches!(embed_input.trim(), "2");
+
+    // Ask how to handle media files with no matching JSON
+    println!("\nIf media files have no matching .json, MetaSort should:\n1. Skip and move to 'Unknown Time'\n2. Try to guess timestamp from filename");
+    let mut unpaired_input = String::new();
+    io::stdin().read_line(&mut unpaired_input).expect("Failed to read line");
+    let guess_dates_from_filename = matches!(unpaired_input.trim(), "2");
 
     // Copy input folder to MetaSort_temp in output directory
     MetaSortUI::print_section_header("Copying Files");
     MetaSortUI::print_info("Copying input folder to working directory...");
     
     let mut ui = MetaSortUI::new();
-    let total_files = count_files_in_directory(input_dir);
+    let total_files = count_files_in_directory(&input_dir);
     ui.start_main_progress(total_files as u64, "Copying files");
     
     let mut copy_options = fs_extra::dir::CopyOptions::new();
@@ -101,23 +137,14 @@ fn main() {
     media_cleaning::clean_json_filenames(temp_dir.to_str().unwrap());
     MetaSortUI::print_success("JSON filename cleaning and pairing complete!");
 
-    // 1b. Ask if WhatsApp/Screenshots should be separated
-    println!("\nDo you want to separate WhatsApp and Screenshot images? (y/n)");
-    let mut wa_sc_input = String::new();
-    io::stdin().read_line(&mut wa_sc_input).expect("Failed to read line");
-    let separate_wa_sc = matches!(wa_sc_input.trim().to_lowercase().as_str(), "y" | "yes");
-    if separate_wa_sc {
-        MetaSortUI::print_success("WhatsApp and Screenshot images will be sorted into their own folders by year/month.");
-    } else {
-        MetaSortUI::print_info("WhatsApp and Screenshot images will be treated as regular photos.");
-    }
-    media_cleaning::ask_and_separate_whatsapp_screenshots(temp_dir.to_str().unwrap(), separate_wa_sc);
+    // 1b. Separate WhatsApp/Screenshots if requested
+    media_cleaning::separate_whatsapp_screenshots(temp_dir.to_str().unwrap(), separate_wa_sc);
 
     // 2. Extract metadata from JSON and embed into media files
     MetaSortUI::print_section_header("Metadata Extraction and Embedding");
     MetaSortUI::print_info("Extracting metadata from JSON and embedding into media files...");
-    let (metadata, failed_guess_paths) = metadata_extraction::extract_metadata(temp_dir.to_str().unwrap());
-    metadata_embed::embed_metadata_all(&metadata, &temp_dir);
+    let (metadata, failed_guess_paths) = metadata_extraction::extract_metadata(temp_dir.to_str().unwrap(), guess_dates_from_filename);
+    metadata_embed::embed_metadata_all(&metadata, &temp_dir, use_filename_date);
     MetaSortUI::print_success("Metadata extraction and embedding complete!");
 
     // 3. Sort files using the embedded metadata (DateTimeOriginal)
