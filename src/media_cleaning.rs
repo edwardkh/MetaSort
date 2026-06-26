@@ -8,7 +8,7 @@ use regex::Regex;
 use std::io::{self, Write};
 use crate::utils::log_to_file;
 
-pub fn separate_whatsapp_screenshots(base_path: &str, separate_wa_sc: bool) {
+pub fn ask_and_separate_whatsapp_screenshots(base_path: &str, separate_wa_sc: bool) {
     if !separate_wa_sc {
         return;
     }
@@ -36,12 +36,36 @@ pub fn separate_whatsapp_screenshots(base_path: &str, separate_wa_sc: bool) {
                 let dest = whatsapp_dir.join(filename);
                 let _ = fs::rename(path, &dest);
                 log_to_file(&logs_dir, "media_cleaning.log", &format!("Moved WhatsApp image {:?} to {:?}", path, dest));
-                // Move .json if exists
-                let json_path = path.with_extension(format!("{}.json", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
-                if json_path.exists() {
-                    let json_dest = whatsapp_dir.join(json_path.file_name().unwrap());
-                    let _ = fs::rename(&json_path, &json_dest);
-                    log_to_file(&logs_dir, "media_cleaning.log", &format!("Moved WhatsApp JSON {:?} to {:?}", json_path, json_dest));
+				// Move .json if exists
+                let filename_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+                let mut found_json = None;
+                
+                let exact = path.with_file_name(format!("{}.json", filename_str));
+                let alt = path.with_extension("json");
+                
+                if exact.exists() {
+                    found_json = Some(exact);
+                } else if alt.exists() {
+                    found_json = Some(alt);
+                } else {
+                    let prefix = format!("{}.", filename_str);
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if name.starts_with(&prefix) && name.ends_with(".json") {
+                                    found_json = Some(entry.path());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(jp) = found_json {
+                    let json_dest = whatsapp_dir.join(jp.file_name().unwrap());
+                    let _ = fs::rename(&jp, &json_dest);
+                    log_to_file(&logs_dir, "media_cleaning.log", &format!("Moved WhatsApp JSON {:?} to {:?}", jp, json_dest));
                 }
                 processed += 1;
                 print_progress(processed, total, path);
@@ -52,12 +76,36 @@ pub fn separate_whatsapp_screenshots(base_path: &str, separate_wa_sc: bool) {
                 let dest = screenshots_dir.join(filename);
                 let _ = fs::rename(path, &dest);
                 log_to_file(&logs_dir, "media_cleaning.log", &format!("Moved Screenshot image {:?} to {:?}", path, dest));
-                // Move .json if exists
-                let json_path = path.with_extension(format!("{}.json", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
-                if json_path.exists() {
-                    let json_dest = screenshots_dir.join(json_path.file_name().unwrap());
-                    let _ = fs::rename(&json_path, &json_dest);
-                    log_to_file(&logs_dir, "media_cleaning.log", &format!("Moved Screenshot JSON {:?} to {:?}", json_path, json_dest));
+				// Move .json if exists
+                let filename_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+                let mut found_json = None;
+                
+                let exact = path.with_file_name(format!("{}.json", filename_str));
+                let alt = path.with_extension("json");
+                
+                if exact.exists() {
+                    found_json = Some(exact);
+                } else if alt.exists() {
+                    found_json = Some(alt);
+                } else {
+                    let prefix = format!("{}.", filename_str);
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if name.starts_with(&prefix) && name.ends_with(".json") {
+                                    found_json = Some(entry.path());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(jp) = found_json {
+                    let json_dest = screenshots_dir.join(jp.file_name().unwrap());
+                    let _ = fs::rename(&jp, &json_dest);
+                    log_to_file(&logs_dir, "media_cleaning.log", &format!("Moved Screenshots JSON {:?} to {:?}", jp, json_dest));
                 }
                 processed += 1;
                 print_progress(processed, total, path);

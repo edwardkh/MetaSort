@@ -1,15 +1,47 @@
 use std::path::{Path, PathBuf};
-use std::io;
+use std::io::{self, Write};
 use std::fs;
-use chrono::Datelike;
+use chrono::{TimeZone, Utc};
 use crate::csv_report;
 use crate::utils::log_to_file;
-use std::io::Write;
 use serde_json;
 use crate::platform::get_exiftool_command;
 
-/// Main function to organize files into folders by type and date.
-pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_paths: &Vec<PathBuf>, separate_wa_sc: bool) {
+pub struct SortCounts {
+    pub photos: usize,
+    pub videos: usize,
+    pub whatsapp: usize,
+    pub screenshots: usize,
+    pub unknown: usize,
+    pub mkv: usize,
+}
+
+/// Generates a unique filename inside dest_dir by appending _1, _2, etc. if duplicates exist.
+fn get_unique_filename(dest_dir: &Path, original_filename: &str) -> String {
+    let candidate = dest_dir.join(original_filename);
+    if !candidate.exists() {
+        return original_filename.to_string();
+    }
+
+    let path_ref = Path::new(original_filename);
+    let stem = path_ref.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path_ref.extension().and_then(|e| e.to_str());
+
+    let mut counter = 1;
+    loop {
+        let new_name = match ext {
+            Some(e) => format!("{}_{}.{}", stem, counter, e),
+            None => format!("{}_{}", stem, counter),
+        };
+        if !dest_dir.join(&new_name).exists() {
+            return new_name;
+        }
+        counter += 1;
+    }
+}
+
+/// Main function to organize files into the flat Media Files folder.
+pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_paths: &Vec<PathBuf>, separate_wa_sc: bool) -> SortCounts {
     let media_extensions = vec![
         // Images
         "jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "tiff", "gif", "avif", "jxl", "jfif",
@@ -18,17 +50,26 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
         "f4v", "wmv", "asf", "rm", "rmvb", "vob", "ogv", "mxf", "dv", "divx", "xvid"
     ];
 
-    // Collect file info for each category
     let mut photos_info = Vec::new();
     let mut videos_info = Vec::new();
     let mut unknown_info = Vec::new();
     let mut mkv_info = Vec::new();
     let mut failed_guess_info = Vec::new();
 
+    let mut counts = SortCounts {
+        photos: 0,
+        videos: 0,
+        whatsapp: 0,
+        screenshots: 0,
+        unknown: 0,
+        mkv: 0,
+    };
+
     let logs_dir = output_dir.join("Technical Files").join("logs");
+    let dest_folder = output_dir.join("Media Files");
+    let _ = fs::create_dir_all(&dest_folder);
 
     let all_files: Vec<_> = walkdir::WalkDir::new(input_dir).into_iter().filter_map(Result::ok).filter(|e| e.path().is_file()).collect();
-    // Only count media files for progress
     let all_media_files: Vec<_> = all_files.iter().filter(|entry| {
         let path = entry.path();
         if path.is_file() {
@@ -38,13 +79,14 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
             false
         }
     }).collect();
+
     let total = all_media_files.len();
     let mut processed = 0;
+
     for entry in all_media_files {
         let path = entry.path();
         if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            // Use exiftool to get DateTimeOriginal, MIMEType, ImageSize
             let output = get_exiftool_command()
                 .arg("-DateTimeOriginal")
                 .arg("-MIMEType")
@@ -52,10 +94,12 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                 .arg("-FileType")
                 .arg(path)
                 .output();
+
             let mut date_str = String::new();
             let mut mime_type = String::new();
             let mut image_size = String::new();
             let mut file_type = String::new();
+
             if let Ok(out) = output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 for line in stdout.lines() {
@@ -70,15 +114,39 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                     }
                 }
             }
-            // If date_str is still empty, try to extract from JSON
+
+            // If date_str is still empty, try to extract from matching JSON
             if date_str.is_empty() {
-                let json_path = path.with_extension(format!("{}json", ext));
-                if json_path.exists() {
-                    if let Ok(json_str) = std::fs::read_to_string(&json_path) {
+                let filename_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let parent = path.parent().unwrap_or_else(|| Path::new(""));
+                let mut found_json = None;
+
+                let exact = path.with_file_name(format!("{}.json", filename_str));
+                let alt = path.with_extension("json");
+
+                if exact.exists() {
+                    found_json = Some(exact);
+                } else if alt.exists() {
+                    found_json = Some(alt);
+                } else {
+                    let prefix = format!("{}.", filename_str);
+                    if let Ok(entries) = fs::read_dir(parent) {
+                        for e in entries.flatten() {
+                            if let Some(name) = e.file_name().to_str() {
+                                if name.starts_with(&prefix) && name.ends_with(".json") {
+                                    found_json = Some(e.path());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(json_path) = found_json {
+                    if let Ok(json_str) = fs::read_to_string(&json_path) {
                         if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
                             if let Some(ts) = json_val["photoTakenTime"]["timestamp"].as_str() {
                                 if let Ok(timestamp) = ts.parse::<i64>() {
-                                    use chrono::{TimeZone, Utc};
                                     let dt = Utc.timestamp_opt(timestamp, 0).unwrap();
                                     date_str = dt.format("%Y:%m:%d %H:%M:%S").to_string();
                                 }
@@ -87,78 +155,54 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                     }
                 }
             }
+
             let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
-            let filename = path.file_name().unwrap().to_string_lossy().to_string();
-            let mut dest_folder = output_dir.join("Media Files");
-            // WhatsApp/Screenshot detection
-            let fname_lc = filename.to_lowercase();
+            let raw_filename = path.file_name().unwrap().to_string_lossy().to_string();
+            let unique_filename = get_unique_filename(&dest_folder, &raw_filename);
+            let dest_path = dest_folder.join(&unique_filename);
+
+            let fname_lc = raw_filename.to_lowercase();
             let is_wa = fname_lc.contains("wa") || fname_lc.contains("whatsapp");
             let is_sc = fname_lc.contains("screenshot");
+
             if separate_wa_sc && is_wa {
-                dest_folder.push("Whatsapp");
-                if let Some(dt) = parse_exif_date(&date_str) {
-                    dest_folder.push(format!("{}", dt.year()));
-                    dest_folder.push(format!("{}", month_name(dt.month())));
-                }
-                photos_info.push((filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                counts.whatsapp += 1;
+                photos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
             } else if separate_wa_sc && is_sc {
-                dest_folder.push("Screenshots");
-                if let Some(dt) = parse_exif_date(&date_str) {
-                    dest_folder.push(format!("{}", dt.year()));
-                    dest_folder.push(format!("{}", month_name(dt.month())));
-                }
-                photos_info.push((filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                counts.screenshots += 1;
+                photos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
             } else if ext == "mkv" {
-                let _file_category = "mkv_files".to_string();
-                dest_folder.push("mkv_files");
-                mkv_info.push((filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                counts.mkv += 1;
+                mkv_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
             } else if date_str.is_empty() {
+                counts.unknown += 1;
                 if failed_guess_paths.contains(&path.to_path_buf()) {
-                    let _file_category = "Failed Filename Guess".to_string();
-                    dest_folder.push("Unknown Time");
-                    dest_folder.push("Failed Filename Guess");
-                    failed_guess_info.push((filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                    failed_guess_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
                 } else {
-                    let _file_category = "Unknown Time".to_string();
-                    dest_folder.push("Unknown Time");
-                    unknown_info.push((filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                    unknown_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
                 }
             } else if mime_type.starts_with("video") || ["mp4","mov","avi","webm","3gp","m4v","mpg","mpeg","mts","m2ts","ts","flv","f4v","wmv","asf","rm","rmvb","vob","ogv","mxf","dv","divx","xvid"].contains(&ext.as_str()) {
-                // Video
-                let _file_category = "Videos".to_string();
-                dest_folder.push("Videos");
-                if let Some(dt) = parse_exif_date(&date_str) {
-                    dest_folder.push(format!("{}", dt.year()));
-                    dest_folder.push(format!("{}", month_name(dt.month())));
-                }
-                videos_info.push((filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                counts.videos += 1;
+                videos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
             } else {
-                // Photo
-                let _file_category = "Photos".to_string();
-                dest_folder.push("Photos");
-                if let Some(dt) = parse_exif_date(&date_str) {
-                    dest_folder.push(format!("{}", dt.year()));
-                    dest_folder.push(format!("{}", month_name(dt.month())));
-                }
-                photos_info.push((filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                counts.photos += 1;
+                photos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
             }
-            // Create destination folder if needed
-            let _ = fs::create_dir_all(&dest_folder);
-            let dest_path = dest_folder.join(&filename);
-            // Copy file
+
             match fs::copy(path, &dest_path) {
                 Ok(_) => {
-                    log_to_file(&logs_dir, "sorting.log", &format!("Copied {:?} to {:?}", path.file_name().unwrap_or_default(), dest_path));
+                    log_to_file(&logs_dir, "sorting.log", &format!("Copied {:?} to {:?}", raw_filename, dest_path));
                 }
                 Err(e) => {
-                    log_to_file(&logs_dir, "sorting.log", &format!("Failed to copy {:?} to {:?}: {}", path.file_name().unwrap_or_default(), dest_path, e));
+                    log_to_file(&logs_dir, "sorting.log", &format!("Failed to copy {:?} to {:?}: {}", raw_filename, dest_path, e));
                 }
             }
+
             processed += 1;
             print_progress(processed, total);
         }
     }
-    // Write CSVs for each category in CSV Report folder
+
     let csv_report_folder = output_dir.join("Technical Files").join("CSV Report");
     let _ = fs::create_dir_all(&csv_report_folder);
     csv_report::write_csv_report(&csv_report_folder, &photos_info, "photos.csv");
@@ -166,41 +210,12 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
     csv_report::write_csv_report(&csv_report_folder, &unknown_info, "unknown_time.csv");
     csv_report::write_csv_report(&csv_report_folder, &mkv_info, "mkv_files.csv");
     csv_report::write_csv_report(&csv_report_folder, &failed_guess_info, "failed_filename_guess.csv");
-    log_to_file(&logs_dir, "sorting.log", "CSV reports written for Photos, Videos, Unknown Time, and mkv_files.");
-    println!("\n📦 Sorting complete! Sorted {} files.", processed);
+    
+    log_to_file(&logs_dir, "sorting.log", "CSV reports written for all categories.");
+    println!("\n📦 Sorting complete! Copied {} files to flat Media Files folder.", processed);
     println!("\n📄 CSV files are added in: {}\nPlease keep this folder safe for future use!", csv_report_folder.display());
 
-    let failed_guess_folder = output_dir.join("Media Files").join("Unknown Time").join("Failed Filename Guess");
-    let _ = fs::create_dir_all(&failed_guess_folder);
-    for path in failed_guess_paths {
-        if let Some(filename) = path.file_name() {
-            let dest = failed_guess_folder.join(filename);
-            let _ = fs::rename(path, &dest);
-            log_to_file(&logs_dir, "sorting.log", &format!("Moved failed guess file {:?} to {:?}", path, dest));
-        }
-    }
-}
-
-fn parse_exif_date(date_str: &str) -> Option<chrono::NaiveDateTime> {
-    chrono::NaiveDateTime::parse_from_str(date_str, "%Y:%m:%d %H:%M:%S").ok()
-}
-
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "January",
-        2 => "February",
-        3 => "March",
-        4 => "April",
-        5 => "May",
-        6 => "June",
-        7 => "July",
-        8 => "August",
-        9 => "September",
-        10 => "October",
-        11 => "November",
-        12 => "December",
-        _ => "Unknown",
-    }
+    counts
 }
 
 fn print_progress(done: usize, total: usize) {
@@ -224,4 +239,3 @@ fn human_readable_size(size: u64) -> String {
         _ => format!("{} B", size),
     }
 }
-
