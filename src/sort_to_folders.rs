@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::io::{self, Write};
 use std::fs;
+use std::sync::Mutex;
+use std::collections::HashSet;
 use chrono::{TimeZone, Utc};
+use rayon::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle};
 use crate::csv_report;
 use crate::utils::log_to_file;
 use serde_json;
@@ -16,31 +19,84 @@ pub struct SortCounts {
     pub mkv: usize,
 }
 
-/// Generates a unique filename inside dest_dir by appending _1, _2, etc. if duplicates exist.
-fn get_unique_filename(dest_dir: &Path, original_filename: &str) -> String {
-    let candidate = dest_dir.join(original_filename);
-    if !candidate.exists() {
-        return original_filename.to_string();
-    }
+type FileInfo = (String, String, String, String, String, u64);
 
+struct SortState {
+    photos_info: Vec<FileInfo>,
+    videos_info: Vec<FileInfo>,
+    unknown_info: Vec<FileInfo>,
+    mkv_info: Vec<FileInfo>,
+    failed_guess_info: Vec<FileInfo>,
+    counts: SortCounts,
+}
+
+impl SortState {
+    fn new() -> Self {
+        Self {
+            photos_info: Vec::new(),
+            videos_info: Vec::new(),
+            unknown_info: Vec::new(),
+            mkv_info: Vec::new(),
+            failed_guess_info: Vec::new(),
+            counts: SortCounts { photos: 0, videos: 0, whatsapp: 0, screenshots: 0, unknown: 0, mkv: 0 },
+        }
+    }
+    
+    // Helper to safely merge states from threads
+    fn merge(&mut self, other: SortState) {
+        self.photos_info.extend(other.photos_info);
+        self.videos_info.extend(other.videos_info);
+        self.unknown_info.extend(other.unknown_info);
+        self.mkv_info.extend(other.mkv_info);
+        self.failed_guess_info.extend(other.failed_guess_info);
+        
+        self.counts.photos += other.counts.photos;
+        self.counts.videos += other.counts.videos;
+        self.counts.whatsapp += other.counts.whatsapp;
+        self.counts.screenshots += other.counts.screenshots;
+        self.counts.unknown += other.counts.unknown;
+        self.counts.mkv += other.counts.mkv;
+    }
+}
+
+// Thread-safe unique filename generator using HashSet claims
+fn get_unique_filename(dest_dir: &Path, original_filename: &str, claimed: &Mutex<HashSet<String>>) -> String {
     let path_ref = Path::new(original_filename);
     let stem = path_ref.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path_ref.extension().and_then(|e| e.to_str());
 
     let mut counter = 1;
+    let mut locked_claimed = claimed.lock().unwrap();
+
+    let mut candidate = original_filename.to_string();
+    
     loop {
-        let new_name = match ext {
+        // Check disk AND memory to handle multi-threading race conditions
+        if !dest_dir.join(&candidate).exists() && !locked_claimed.contains(&candidate) {
+            locked_claimed.insert(candidate.clone());
+            return candidate;
+        }
+        
+        candidate = match ext {
             Some(e) => format!("{}_{}.{}", stem, counter, e),
             None => format!("{}_{}", stem, counter),
         };
-        if !dest_dir.join(&new_name).exists() {
-            return new_name;
-        }
         counter += 1;
     }
 }
 
-/// Main function to organize files into the flat Media Files folder.
+fn human_readable_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    match size {
+        s if s >= GB => format!("{:.2} GB", s as f64 / GB as f64),
+        s if s >= MB => format!("{:.2} MB", s as f64 / MB as f64),
+        s if s >= KB => format!("{:.2} KB", s as f64 / KB as f64),
+        _ => format!("{} B", size),
+    }
+}
+
 pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_paths: &Vec<PathBuf>, separate_wa_sc: bool) -> SortCounts {
     let media_extensions = vec![
         // Images
@@ -50,27 +106,12 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
         "f4v", "wmv", "asf", "rm", "rmvb", "vob", "ogv", "mxf", "dv", "divx", "xvid"
     ];
 
-    let mut photos_info = Vec::new();
-    let mut videos_info = Vec::new();
-    let mut unknown_info = Vec::new();
-    let mut mkv_info = Vec::new();
-    let mut failed_guess_info = Vec::new();
-
-    let mut counts = SortCounts {
-        photos: 0,
-        videos: 0,
-        whatsapp: 0,
-        screenshots: 0,
-        unknown: 0,
-        mkv: 0,
-    };
-
     let logs_dir = output_dir.join("Technical Files").join("logs");
     let dest_folder = output_dir.join("Media Files");
     let _ = fs::create_dir_all(&dest_folder);
 
     let all_files: Vec<_> = walkdir::WalkDir::new(input_dir).into_iter().filter_map(Result::ok).filter(|e| e.path().is_file()).collect();
-    let all_media_files: Vec<_> = all_files.iter().filter(|entry| {
+    let all_media_files: Vec<_> = all_files.into_iter().filter(|entry| {
         let path = entry.path();
         if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -80,13 +121,26 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
         }
     }).collect();
 
-    let total = all_media_files.len();
-    let mut processed = 0;
+    let total = all_media_files.len() as u64;
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.yellow/white}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("🟨⬜")
+    );
+    pb.set_message("Sorting files...");
 
-    for entry in all_media_files {
-        let path = entry.path();
-        if path.is_file() {
+    let claimed_filenames = Mutex::new(HashSet::new());
+    let log_mutex = Mutex::new(());
+
+    // Process files in parallel, fold data locally for each thread, reduce everything back together at the end
+    let final_state = all_media_files.into_par_iter().fold(
+        || SortState::new(),
+        |mut local_state, entry| {
+            let path = entry.path();
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            
             let output = get_exiftool_command()
                 .arg("-DateTimeOriginal")
                 .arg("-MIMEType")
@@ -115,7 +169,6 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                 }
             }
 
-            // If date_str is still empty, try to extract from matching JSON
             if date_str.is_empty() {
                 let filename_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let parent = path.parent().unwrap_or_else(|| Path::new(""));
@@ -158,84 +211,78 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
 
             let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
             let raw_filename = path.file_name().unwrap().to_string_lossy().to_string();
-            let unique_filename = get_unique_filename(&dest_folder, &raw_filename);
+            
+            // Atomically generate and claim unique filename
+            let unique_filename = get_unique_filename(&dest_folder, &raw_filename, &claimed_filenames);
             let dest_path = dest_folder.join(&unique_filename);
 
             let fname_lc = raw_filename.to_lowercase();
             let is_wa = fname_lc.contains("wa") || fname_lc.contains("whatsapp");
             let is_sc = fname_lc.contains("screenshot");
+            
+            let file_info = (unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size);
 
             if separate_wa_sc && is_wa {
-                counts.whatsapp += 1;
-                photos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                local_state.counts.whatsapp += 1;
+                local_state.photos_info.push(file_info);
             } else if separate_wa_sc && is_sc {
-                counts.screenshots += 1;
-                photos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                local_state.counts.screenshots += 1;
+                local_state.photos_info.push(file_info);
             } else if ext == "mkv" {
-                counts.mkv += 1;
-                mkv_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                local_state.counts.mkv += 1;
+                local_state.mkv_info.push(file_info);
             } else if date_str.is_empty() {
-                counts.unknown += 1;
+                local_state.counts.unknown += 1;
                 if failed_guess_paths.contains(&path.to_path_buf()) {
-                    failed_guess_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                    local_state.failed_guess_info.push(file_info);
                 } else {
-                    unknown_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                    local_state.unknown_info.push(file_info);
                 }
             } else if mime_type.starts_with("video") || ["mp4","mov","avi","webm","3gp","m4v","mpg","mpeg","mts","m2ts","ts","flv","f4v","wmv","asf","rm","rmvb","vob","ogv","mxf","dv","divx","xvid"].contains(&ext.as_str()) {
-                counts.videos += 1;
-                videos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                local_state.counts.videos += 1;
+                local_state.videos_info.push(file_info);
             } else {
-                counts.photos += 1;
-                photos_info.push((unique_filename.clone(), file_type.clone(), date_str.clone(), image_size.clone(), human_readable_size(file_size), file_size));
+                local_state.counts.photos += 1;
+                local_state.photos_info.push(file_info);
             }
 
             match fs::copy(path, &dest_path) {
                 Ok(_) => {
+                    let _lock = log_mutex.lock().unwrap();
                     log_to_file(&logs_dir, "sorting.log", &format!("Copied {:?} to {:?}", raw_filename, dest_path));
                 }
                 Err(e) => {
+                    let _lock = log_mutex.lock().unwrap();
                     log_to_file(&logs_dir, "sorting.log", &format!("Failed to copy {:?} to {:?}: {}", raw_filename, dest_path, e));
                 }
             }
 
-            processed += 1;
-            print_progress(processed, total);
+            pb.inc(1);
+            local_state
         }
-    }
+    ).reduce(
+        || SortState::new(),
+        |mut merged, state| {
+            merged.merge(state);
+            merged
+        }
+    );
+
+    pb.finish_with_message("Sorting complete!");
 
     let csv_report_folder = output_dir.join("Technical Files").join("CSV Report");
     let _ = fs::create_dir_all(&csv_report_folder);
-    csv_report::write_csv_report(&csv_report_folder, &photos_info, "photos.csv");
-    csv_report::write_csv_report(&csv_report_folder, &videos_info, "videos.csv");
-    csv_report::write_csv_report(&csv_report_folder, &unknown_info, "unknown_time.csv");
-    csv_report::write_csv_report(&csv_report_folder, &mkv_info, "mkv_files.csv");
-    csv_report::write_csv_report(&csv_report_folder, &failed_guess_info, "failed_filename_guess.csv");
+    csv_report::write_csv_report(&csv_report_folder, &final_state.photos_info, "photos.csv");
+    csv_report::write_csv_report(&csv_report_folder, &final_state.videos_info, "videos.csv");
+    csv_report::write_csv_report(&csv_report_folder, &final_state.unknown_info, "unknown_time.csv");
+    csv_report::write_csv_report(&csv_report_folder, &final_state.mkv_info, "mkv_files.csv");
+    csv_report::write_csv_report(&csv_report_folder, &final_state.failed_guess_info, "failed_filename_guess.csv");
     
     log_to_file(&logs_dir, "sorting.log", "CSV reports written for all categories.");
-    println!("\n📦 Sorting complete! Copied {} files to flat Media Files folder.", processed);
+    
+    let total_processed = final_state.counts.photos + final_state.counts.videos + final_state.counts.whatsapp + final_state.counts.screenshots + final_state.counts.unknown + final_state.counts.mkv;
+    println!("\n📦 Sorting complete! Copied {} files to flat Media Files folder.", total_processed);
     println!("\n📄 CSV files are added in: {}\nPlease keep this folder safe for future use!", csv_report_folder.display());
 
-    counts
-}
-
-fn print_progress(done: usize, total: usize) {
-    let percent = if total > 0 { (done * 100) / total } else { 100 };
-    let bar = format!("{}{}", "🟨".repeat(percent / 4), "⬜".repeat(25 - percent / 4));
-    print!("\r📦 Sorting: [{}] {}% ({} / {})", bar, percent, done, total);
-    let _ = io::stdout().flush();
-    if done == total {
-        println!();
-    }
-}
-
-fn human_readable_size(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    match size {
-        s if s >= GB => format!("{:.2} GB", s as f64 / GB as f64),
-        s if s >= MB => format!("{:.2} MB", s as f64 / MB as f64),
-        s if s >= KB => format!("{:.2} KB", s as f64 / KB as f64),
-        _ => format!("{} B", size),
-    }
+    final_state.counts
 }
