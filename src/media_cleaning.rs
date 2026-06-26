@@ -7,6 +7,9 @@ use walkdir::WalkDir;
 use regex::Regex;
 use std::io::{self, Write};
 use crate::utils::log_to_file;
+use std::sync::Mutex;
+use rayon::prelude::*;
+use crate::utils::log_to_file;
 
 pub fn ask_and_separate_whatsapp_screenshots(base_path: &str, separate_wa_sc: bool) {
     if !separate_wa_sc {
@@ -138,39 +141,59 @@ pub fn clean_json_filenames(base_path: &str) {
     let temp_dir = Path::new(base_path).join("`MetaSort_temp");
     let _ = fs::create_dir_all(&temp_dir);
     let log_path = temp_dir.join("rename_log.txt");
-    let mut log_file = fs::File::create(&log_path).expect("Failed to create log file");
+    let log_file = fs::File::create(&log_path).expect("Failed to create log file");
+    
+    // Wrap the file inside a Mutex so multiple threads can write to it safely
+    let log_mutex = Mutex::new(log_file);
 
-    for entry in WalkDir::new(base_path).into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext_lc = ext.to_lowercase();
-                if media_extensions.contains(&ext_lc.as_str()) {
-                    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let parent = path.parent().unwrap_or(Path::new(""));
-                    if let Ok(entries) = fs::read_dir(parent) {
-                        for json_entry in entries {
-                            if let Ok(json_file) = json_entry {
-                                let json_path = json_file.path();
-                                if json_path.is_file() {
-                                    if let Some(json_name) = json_path.file_name().and_then(|n| n.to_str()) {
-                                        if json_name.starts_with(filename) && json_name.ends_with(".json") && json_name != format!("{}.json", filename) {
-                                            let new_json_path = parent.join(format!("{}.json", filename));
-                                            if let Err(e) = fs::rename(&json_path, &new_json_path) {
-                                                let _ = log_file.write_all(format!("❌ Failed to rename {:?} to {:?}: {}\n", json_path, new_json_path, e).as_bytes());
-                                            } else {
-                                                let _ = log_file.write_all(format!("✅ Renamed JSON {:?} to {:?}\n", json_path, new_json_path).as_bytes());
-                                            }
-                                        }
-                                    }
-                                }
+    // 1. Collect all media files sequentially first (WalkDir doesn't support parallel traversal)
+    let media_files: Vec<PathBuf> = WalkDir::new(base_path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| {
+            if p.is_file() {
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    let ext_lc = ext.to_lowercase();
+                    return media_extensions.contains(&ext_lc.as_str());
+                }
+            }
+            false
+        })
+        .collect();
+
+    // 2. Process JSON cleaning in parallel
+    media_files.par_iter().for_each(|path| {
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let parent = path.parent().unwrap_or(Path::new(""));
+        
+        if let Ok(entries) = fs::read_dir(parent) {
+            for json_entry in entries.flatten() {
+                let json_path = json_entry.path();
+                
+                if json_path.is_file() {
+                    if let Some(json_name) = json_path.file_name().and_then(|n| n.to_str()) {
+                        let expected_name = format!("{}.json", filename);
+                        
+                        // Check if the file is a loosely matched JSON that needs renaming
+                        if json_name.starts_with(filename) && json_name.ends_with(".json") && json_name != expected_name {
+                            let new_json_path = parent.join(&expected_name);
+                            
+                            // Lock the log mutex just before writing
+                            let mut log = log_mutex.lock().unwrap();
+                            if let Err(e) = fs::rename(&json_path, &new_json_path) {
+                                let _ = log.write_all(format!("❌ Failed to rename {:?} to {:?}: {}\n", json_path, new_json_path, e).as_bytes());
+                            } else {
+                                let _ = log.write_all(format!("✅ Renamed JSON {:?} to {:?}\n", json_path, new_json_path).as_bytes());
                             }
                         }
                     }
                 }
             }
         }
-    }
-    let summary = format!("\n🧹 JSON filename cleaning complete.\n");
-    let _ = log_file.write_all(summary.as_bytes());
-} 
+    });
+
+    let summary = "\n🧹 JSON filename cleaning complete.\n";
+    let mut log = log_mutex.lock().unwrap();
+    let _ = log.write_all(summary.as_bytes());
+}
