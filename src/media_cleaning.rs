@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use crate::utils::log_to_file;
 use std::sync::Mutex;
 use rayon::prelude::*;
-use crate::utils::log_to_file;
+use crate::PathBuf;
 
 pub fn ask_and_separate_whatsapp_screenshots(base_path: &str, separate_wa_sc: bool) {
     if !separate_wa_sc {

@@ -59,21 +59,23 @@ impl SortState {
     }
 }
 
-// Thread-safe unique filename generator using HashSet claims
-fn get_unique_filename(dest_dir: &Path, original_filename: &str, claimed: &Mutex<HashSet<String>>) -> String {
+// Thread-safe unique filename generator using HashSet claims containing PathBufs
+fn get_unique_filename(dest_dir: &Path, original_filename: &str, claimed_paths: &Mutex<HashSet<PathBuf>>) -> String {
     let path_ref = Path::new(original_filename);
     let stem = path_ref.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path_ref.extension().and_then(|e| e.to_str());
 
     let mut counter = 1;
-    let mut locked_claimed = claimed.lock().unwrap();
+    let mut locked_claimed = claimed_paths.lock().unwrap();
 
     let mut candidate = original_filename.to_string();
     
     loop {
-        // Check disk AND memory to handle multi-threading race conditions
-        if !dest_dir.join(&candidate).exists() && !locked_claimed.contains(&candidate) {
-            locked_claimed.insert(candidate.clone());
+        // Check disk AND memory to handle multi-threading race conditions across multiple folders
+        let full_dest = dest_dir.join(&candidate);
+        
+        if !full_dest.exists() && !locked_claimed.contains(&full_dest) {
+            locked_claimed.insert(full_dest);
             return candidate;
         }
         
@@ -107,8 +109,12 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
     ];
 
     let logs_dir = output_dir.join("Technical Files").join("logs");
-    let dest_folder = output_dir.join("Media Files");
-    let _ = fs::create_dir_all(&dest_folder);
+    
+    // Set up the two destination folders
+    let media_folder = output_dir.join("Media Files");
+    let unknown_folder = output_dir.join("Unknown Time");
+    let _ = fs::create_dir_all(&media_folder);
+    let _ = fs::create_dir_all(&unknown_folder);
 
     let all_files: Vec<_> = walkdir::WalkDir::new(input_dir).into_iter().filter_map(Result::ok).filter(|e| e.path().is_file()).collect();
     let all_media_files: Vec<_> = all_files.into_iter().filter(|entry| {
@@ -131,7 +137,8 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
     );
     pb.set_message("Sorting files...");
 
-    let claimed_filenames = Mutex::new(HashSet::new());
+    // Now tracks PathBuf instead of Strings to support uniqueness across split directories
+    let claimed_paths = Mutex::new(HashSet::new());
     let log_mutex = Mutex::new(());
 
     // Process files in parallel, fold data locally for each thread, reduce everything back together at the end
@@ -212,9 +219,16 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
             let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
             let raw_filename = path.file_name().unwrap().to_string_lossy().to_string();
             
-            // Atomically generate and claim unique filename
-            let unique_filename = get_unique_filename(&dest_folder, &raw_filename, &claimed_filenames);
-            let dest_path = dest_folder.join(&unique_filename);
+            // Route to correct folder depending on whether a timestamp was found
+            let target_folder = if date_str.is_empty() {
+                &unknown_folder
+            } else {
+                &media_folder
+            };
+
+            // Atomically generate and claim unique filename within the specific target directory
+            let unique_filename = get_unique_filename(target_folder, &raw_filename, &claimed_paths);
+            let dest_path = target_folder.join(&unique_filename);
 
             let fname_lc = raw_filename.to_lowercase();
             let is_wa = fname_lc.contains("wa") || fname_lc.contains("whatsapp");
@@ -281,7 +295,7 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
     log_to_file(&logs_dir, "sorting.log", "CSV reports written for all categories.");
     
     let total_processed = final_state.counts.photos + final_state.counts.videos + final_state.counts.whatsapp + final_state.counts.screenshots + final_state.counts.unknown + final_state.counts.mkv;
-    println!("\n📦 Sorting complete! Copied {} files to flat Media Files folder.", total_processed);
+    println!("\n📦 Sorting complete! Copied {} files to Media Files and Unknown Time folders.", total_processed);
     println!("\n📄 CSV files are added in: {}\nPlease keep this folder safe for future use!", csv_report_folder.display());
 
     final_state.counts
