@@ -69,21 +69,26 @@ fn get_unique_dest_path(
     let ext = source_path.extension().and_then(|e| e.to_str());
     let ext_lower = ext.unwrap_or("").to_lowercase();
 
-    // Identify if this is a component of an iOS Live Photo
-    let is_live = if ext_lower == "heic" {
-        source_path.with_extension("mp4").exists() || source_path.with_extension("MP4").exists()
+    // Identify if this is a component of an iOS Live Photo by finding its sibling
+    let mut sibling_path = None;
+    if ext_lower == "heic" || ext_lower == "jpg" || ext_lower == "jpeg" {
+        let mp4 = source_path.with_extension("mp4");
+        let mp4_up = source_path.with_extension("MP4");
+        if mp4.exists() { sibling_path = Some(mp4); }
+        else if mp4_up.exists() { sibling_path = Some(mp4_up); }
     } else if ext_lower == "mp4" {
-        source_path.with_extension("heic").exists() || source_path.with_extension("HEIC").exists()
-    } else {
-        false
-    };
+        // Look for any valid Live Photo image format sibling
+        for e in &["heic", "HEIC", "jpg", "JPG", "jpeg", "JPEG"] {
+            let p = source_path.with_extension(e);
+            if p.exists() {
+                sibling_path = Some(p);
+                break;
+            }
+        }
+    }
 
-    // The key uniquely identifies the pair based on its original source location
-    let live_key = if is_live {
-        Some(source_path.with_extension("")) 
-    } else {
-        None
-    };
+    let is_live = sibling_path.is_some();
+    let live_key = if is_live { Some(source_path.with_extension("")) } else { None };
 
     let mut locked_live_map = live_photo_map.lock().unwrap();
     let mut locked_claimed = claimed_paths.lock().unwrap();
@@ -108,15 +113,16 @@ fn get_unique_dest_path(
         let mut is_free = true;
         
         if is_live {
-            // For live photos, BOTH extensions must be free in the destination to prevent splitting the pair
-            let heic_ext = if ext_lower == "heic" { ext.unwrap() } else { "HEIC" };
-            let mp4_ext = if ext_lower == "mp4" { ext.unwrap() } else { "MP4" };
+            // For live photos, BOTH extensions must be free in the destination
+            let sibling = sibling_path.as_ref().unwrap();
+            let sibling_ext = sibling.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let my_ext = ext.unwrap_or("");
+
+            let my_dest = dest_dir.join(format!("{}.{}", candidate_stem, my_ext));
+            let sibling_dest = dest_dir.join(format!("{}.{}", candidate_stem, sibling_ext));
             
-            let heic_dest = dest_dir.join(format!("{}.{}", candidate_stem, heic_ext));
-            let mp4_dest = dest_dir.join(format!("{}.{}", candidate_stem, mp4_ext));
-            
-            if heic_dest.exists() || locked_claimed.contains(&heic_dest) || 
-               mp4_dest.exists() || locked_claimed.contains(&mp4_dest) {
+            if my_dest.exists() || locked_claimed.contains(&my_dest) || 
+               sibling_dest.exists() || locked_claimed.contains(&sibling_dest) {
                 is_free = false;
             }
         } else {
@@ -280,23 +286,21 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                 }
             }
 
-            // If an .MP4 component of a Live Photo is missing a date, borrow it from the .HEIC sibling
+            // If an .MP4 component of a Live Photo is missing a date, borrow it from the image sibling
             if date_str.is_empty() && ext == "mp4" {
-                let heic_path = path.with_extension("heic");
-                let heic_path_upper = path.with_extension("HEIC");
-                
-                let sibling = if heic_path.exists() {
-                    Some(heic_path)
-                } else if heic_path_upper.exists() {
-                    Some(heic_path_upper)
-                } else {
-                    None
-                };
+                let mut sibling = None;
+                for e in &["heic", "HEIC", "jpg", "JPG", "jpeg", "JPEG"] {
+                    let p = path.with_extension(e);
+                    if p.exists() {
+                        sibling = Some(p);
+                        break;
+                    }
+                }
 
-                if let Some(hp) = sibling {
-                    // 1. Check EXIF of the HEIC sibling
-                    if let Ok(heic_out) = get_exiftool_command().arg("-DateTimeOriginal").arg(&hp).output() {
-                        let stdout = String::from_utf8_lossy(&heic_out.stdout);
+                if let Some(img_path) = sibling {
+                    // 1. Check EXIF of the image sibling
+                    if let Ok(img_out) = get_exiftool_command().arg("-DateTimeOriginal").arg(&img_path).output() {
+                        let stdout = String::from_utf8_lossy(&img_out.stdout);
                         for line in stdout.lines() {
                             if line.contains("Date/Time Original") {
                                 date_str = line.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string();
@@ -304,26 +308,26 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                         }
                     }
 
-                    // 2. Check JSON of the HEIC sibling if EXIF was empty
+                    // 2. Check JSON of the image sibling if EXIF was empty
                     if date_str.is_empty() {
-                        let h_filename = hp.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let h_parent = hp.parent().unwrap_or_else(|| Path::new(""));
-                        let mut h_json = None;
+                        let img_filename = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        let img_parent = img_path.parent().unwrap_or_else(|| Path::new(""));
+                        let mut img_json = None;
 
-                        let exact = hp.with_file_name(format!("{}.json", h_filename));
-                        let alt = hp.with_extension("json");
+                        let exact = img_path.with_file_name(format!("{}.json", img_filename));
+                        let alt = img_path.with_extension("json");
 
                         if exact.exists() {
-                            h_json = Some(exact);
+                            img_json = Some(exact);
                         } else if alt.exists() {
-                            h_json = Some(alt);
+                            img_json = Some(alt);
                         } else {
-                            let prefix = format!("{}.", h_filename);
-                            if let Ok(entries) = fs::read_dir(h_parent) {
+                            let prefix = format!("{}.", img_filename);
+                            if let Ok(entries) = fs::read_dir(img_parent) {
                                 for e in entries.flatten() {
                                     if let Some(name) = e.file_name().to_str() {
                                         if name.starts_with(&prefix) && name.ends_with(".json") {
-                                            h_json = Some(e.path());
+                                            img_json = Some(e.path());
                                             break;
                                         }
                                     }
@@ -331,7 +335,7 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                             }
                         }
 
-                        if let Some(json_path) = h_json {
+                        if let Some(json_path) = img_json {
                             if let Ok(json_str) = fs::read_to_string(&json_path) {
                                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
                                     if let Some(ts) = json_val["photoTakenTime"]["timestamp"].as_str() {
