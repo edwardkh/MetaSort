@@ -57,11 +57,7 @@ pub fn embed_metadata_all(metadata_list: &[MediaMetadata], log_dir: &Path) {
         }
         
         if let Some(ref date) = date_to_embed {
-            if meta.media_path.extension().map(|e| e.to_ascii_lowercase()) == Some("png".into()) {
-                args.push(format!("-XMP:DateTimeOriginal={}", date));
-            } else {
-                args.push(format!("-DateTimeOriginal={}", date));
-            }
+            args.push(format!("-EXIF:DateTimeOriginal={}", date));
         }
         if let (Some(lat), Some(lon)) = (meta.gps_latitude, meta.gps_longitude) {
             args.push(format!("-GPSLatitude={}", lat));
