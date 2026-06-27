@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::sync::Mutex;
-use std::collections::HashSet;
 use chrono::{TimeZone, Utc};
 use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -9,6 +8,7 @@ use crate::csv_report;
 use crate::utils::log_to_file;
 use serde_json;
 use crate::platform::get_exiftool_command;
+use std::collections::{HashSet, HashMap};
 
 pub struct SortCounts {
     pub photos: usize,
@@ -59,30 +59,93 @@ impl SortState {
     }
 }
 
-// Thread-safe unique filename generator using HashSet claims containing PathBufs
-fn get_unique_filename(dest_dir: &Path, original_filename: &str, claimed_paths: &Mutex<HashSet<PathBuf>>) -> String {
-    let path_ref = Path::new(original_filename);
-    let stem = path_ref.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path_ref.extension().and_then(|e| e.to_str());
+fn get_unique_dest_path(
+    source_path: &Path,
+    dest_dir: &Path,
+    claimed_paths: &Mutex<HashSet<PathBuf>>,
+    live_photo_map: &Mutex<HashMap<PathBuf, String>>,
+) -> PathBuf {
+    let stem = source_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = source_path.extension().and_then(|e| e.to_str());
+    let ext_lower = ext.unwrap_or("").to_lowercase();
 
-    let mut counter = 1;
+    // Identify if this is a component of an iOS Live Photo
+    let is_live = if ext_lower == "heic" {
+        source_path.with_extension("mp4").exists() || source_path.with_extension("MP4").exists()
+    } else if ext_lower == "mp4" {
+        source_path.with_extension("heic").exists() || source_path.with_extension("HEIC").exists()
+    } else {
+        false
+    };
+
+    // The key uniquely identifies the pair based on its original source location
+    let live_key = if is_live {
+        Some(source_path.with_extension("")) 
+    } else {
+        None
+    };
+
+    let mut locked_live_map = live_photo_map.lock().unwrap();
     let mut locked_claimed = claimed_paths.lock().unwrap();
 
-    let mut candidate = original_filename.to_string();
+    // If the other half of this Live Photo was already processed, use its assigned stem
+    if let Some(key) = &live_key {
+        if let Some(assigned_stem) = locked_live_map.get(key) {
+            let final_name = match ext {
+                Some(e) => format!("{}.{}", assigned_stem, e),
+                None => assigned_stem.to_string(),
+            };
+            let full_dest = dest_dir.join(&final_name);
+            locked_claimed.insert(full_dest.clone());
+            return full_dest;
+        }
+    }
+
+    let mut counter = 1;
+    let mut candidate_stem = stem.to_string();
     
     loop {
-        // Check disk AND memory to handle multi-threading race conditions across multiple folders
-        let full_dest = dest_dir.join(&candidate);
+        let mut is_free = true;
         
-        if !full_dest.exists() && !locked_claimed.contains(&full_dest) {
-            locked_claimed.insert(full_dest);
-            return candidate;
+        if is_live {
+            // For live photos, BOTH extensions must be free in the destination to prevent splitting the pair
+            let heic_ext = if ext_lower == "heic" { ext.unwrap() } else { "HEIC" };
+            let mp4_ext = if ext_lower == "mp4" { ext.unwrap() } else { "MP4" };
+            
+            let heic_dest = dest_dir.join(format!("{}.{}", candidate_stem, heic_ext));
+            let mp4_dest = dest_dir.join(format!("{}.{}", candidate_stem, mp4_ext));
+            
+            if heic_dest.exists() || locked_claimed.contains(&heic_dest) || 
+               mp4_dest.exists() || locked_claimed.contains(&mp4_dest) {
+                is_free = false;
+            }
+        } else {
+            let candidate_name = match ext {
+                Some(e) => format!("{}.{}", candidate_stem, e),
+                None => candidate_stem.clone(),
+            };
+            let full_dest = dest_dir.join(&candidate_name);
+            if full_dest.exists() || locked_claimed.contains(&full_dest) {
+                is_free = false;
+            }
         }
-        
-        candidate = match ext {
-            Some(e) => format!("{}_{}.{}", stem, counter, e),
-            None => format!("{}_{}", stem, counter),
-        };
+
+        if is_free {
+            // If this is a Live Photo, remember the successful stem for the counterpart
+            if let Some(key) = live_key {
+                locked_live_map.insert(key, candidate_stem.clone());
+            }
+            
+            let final_name = match ext {
+                Some(e) => format!("{}.{}", candidate_stem, e),
+                None => candidate_stem,
+            };
+            let full_dest = dest_dir.join(&final_name);
+            locked_claimed.insert(full_dest.clone());
+            return full_dest;
+        }
+
+        candidate_stem = format!("{}_{}", stem, counter);
         counter += 1;
     }
 }
@@ -139,6 +202,7 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
 
     // Now tracks PathBuf instead of Strings to support uniqueness across split directories
     let claimed_paths = Mutex::new(HashSet::new());
+    let live_photo_map = Mutex::new(HashMap::new()); // Tracks iOS Live Photo pairs
     let log_mutex = Mutex::new(());
 
     // Process files in parallel, fold data locally for each thread, reduce everything back together at the end
@@ -227,8 +291,8 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
             };
 
             // Atomically generate and claim unique filename within the specific target directory
-            let unique_filename = get_unique_filename(target_folder, &raw_filename, &claimed_paths);
-            let dest_path = target_folder.join(&unique_filename);
+            let dest_path = get_unique_dest_path(path, target_folder, &claimed_paths, &live_photo_map);
+            let unique_filename = dest_path.file_name().unwrap().to_string_lossy().to_string();
 
             let fname_lc = raw_filename.to_lowercase();
             let is_wa = fname_lc.contains("wa") || fname_lc.contains("whatsapp");
