@@ -280,6 +280,73 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                 }
             }
 
+            // If an .MP4 component of a Live Photo is missing a date, borrow it from the .HEIC sibling
+            if date_str.is_empty() && ext == "mp4" {
+                let heic_path = path.with_extension("heic");
+                let heic_path_upper = path.with_extension("HEIC");
+                
+                let sibling = if heic_path.exists() {
+                    Some(heic_path)
+                } else if heic_path_upper.exists() {
+                    Some(heic_path_upper)
+                } else {
+                    None
+                };
+
+                if let Some(hp) = sibling {
+                    // 1. Check EXIF of the HEIC sibling
+                    if let Ok(heic_out) = get_exiftool_command().arg("-DateTimeOriginal").arg(&hp).output() {
+                        let stdout = String::from_utf8_lossy(&heic_out.stdout);
+                        for line in stdout.lines() {
+                            if line.contains("Date/Time Original") {
+                                date_str = line.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string();
+                            }
+                        }
+                    }
+
+                    // 2. Check JSON of the HEIC sibling if EXIF was empty
+                    if date_str.is_empty() {
+                        let h_filename = hp.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        let h_parent = hp.parent().unwrap_or_else(|| Path::new(""));
+                        let mut h_json = None;
+
+                        let exact = hp.with_file_name(format!("{}.json", h_filename));
+                        let alt = hp.with_extension("json");
+
+                        if exact.exists() {
+                            h_json = Some(exact);
+                        } else if alt.exists() {
+                            h_json = Some(alt);
+                        } else {
+                            let prefix = format!("{}.", h_filename);
+                            if let Ok(entries) = fs::read_dir(h_parent) {
+                                for e in entries.flatten() {
+                                    if let Some(name) = e.file_name().to_str() {
+                                        if name.starts_with(&prefix) && name.ends_with(".json") {
+                                            h_json = Some(e.path());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(json_path) = h_json {
+                            if let Ok(json_str) = fs::read_to_string(&json_path) {
+                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                                    if let Some(ts) = json_val["photoTakenTime"]["timestamp"].as_str() {
+                                        if let Ok(timestamp) = ts.parse::<i64>() {
+                                            let dt = Utc.timestamp_opt(timestamp, 0).unwrap();
+                                            date_str = dt.format("%Y:%m:%d %H:%M:%S").to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
             let raw_filename = path.file_name().unwrap().to_string_lossy().to_string();
             
