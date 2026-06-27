@@ -69,16 +69,27 @@ fn get_unique_dest_path(
     let ext = source_path.extension().and_then(|e| e.to_str());
     let ext_lower = ext.unwrap_or("").to_lowercase();
 
-    // Identify if this is a component of an iOS Live Photo by finding its sibling
+    let image_exts_lower = ["heic", "jpg", "jpeg"];
+    let video_exts_lower = ["mp4", "mov"];
+    
+    let image_exts_fs = ["heic", "HEIC", "jpg", "JPG", "jpeg", "JPEG"];
+    let video_exts_fs = ["mp4", "MP4", "mov", "MOV"];
+
+    let is_img = image_exts_lower.contains(&ext_lower.as_str());
+    let is_vid = video_exts_lower.contains(&ext_lower.as_str());
+
+    // Identify if this is a component of an iOS Live Photo by finding its sibling in the SAME source folder
     let mut sibling_path = None;
-    if ext_lower == "heic" || ext_lower == "jpg" || ext_lower == "jpeg" {
-        let mp4 = source_path.with_extension("mp4");
-        let mp4_up = source_path.with_extension("MP4");
-        if mp4.exists() { sibling_path = Some(mp4); }
-        else if mp4_up.exists() { sibling_path = Some(mp4_up); }
-    } else if ext_lower == "mp4" {
-        // Look for any valid Live Photo image format sibling
-        for e in &["heic", "HEIC", "jpg", "JPG", "jpeg", "JPEG"] {
+    if is_img {
+        for e in &video_exts_fs {
+            let p = source_path.with_extension(e);
+            if p.exists() {
+                sibling_path = Some(p);
+                break;
+            }
+        }
+    } else if is_vid {
+        for e in &image_exts_fs {
             let p = source_path.with_extension(e);
             if p.exists() {
                 sibling_path = Some(p);
@@ -112,42 +123,59 @@ fn get_unique_dest_path(
     loop {
         let mut is_free = true;
         
-        if is_live {
-            // For live photos, BOTH extensions must be free in the destination
-            let sibling = sibling_path.as_ref().unwrap();
-            let sibling_ext = sibling.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let my_ext = ext.unwrap_or("");
+        // 1. Check our own actual destination
+        let candidate_name = match ext {
+            Some(e) => format!("{}.{}", candidate_stem, e),
+            None => candidate_stem.clone(),
+        };
+        let full_dest = dest_dir.join(&candidate_name);
+        
+        if full_dest.exists() || locked_claimed.contains(&full_dest) {
+            is_free = false;
+        }
 
-            let my_dest = dest_dir.join(format!("{}.{}", candidate_stem, my_ext));
-            let sibling_dest = dest_dir.join(format!("{}.{}", candidate_stem, sibling_ext));
-            
-            if my_dest.exists() || locked_claimed.contains(&my_dest) || 
-               sibling_dest.exists() || locked_claimed.contains(&sibling_dest) {
-                is_free = false;
-            }
-        } else {
-            let candidate_name = match ext {
-                Some(e) => format!("{}.{}", candidate_stem, e),
-                None => candidate_stem.clone(),
+        // 2. Check all counterparts to avoid making fake Live Photos out of unrelated files
+        if is_free {
+            let counterparts = if is_img {
+                &video_exts_fs[..]
+            } else if is_vid {
+                &image_exts_fs[..]
+            } else {
+                &[]
             };
-            let full_dest = dest_dir.join(&candidate_name);
-            if full_dest.exists() || locked_claimed.contains(&full_dest) {
-                is_free = false;
+
+            for ce in counterparts {
+                let cp_dest = dest_dir.join(format!("{}.{}", candidate_stem, ce));
+                if cp_dest.exists() || locked_claimed.contains(&cp_dest) {
+                    is_free = false;
+                    break;
+                }
             }
         }
 
         if is_free {
-            // If this is a Live Photo, remember the successful stem for the counterpart
+            // We found a free stem!
+            
+            // Reserve our actual destination
+            locked_claimed.insert(full_dest.clone());
+
+            // Reserve ALL counterparts so future unrelated files can't steal them
+            let counterparts = if is_img {
+                &video_exts_fs[..]
+            } else if is_vid {
+                &image_exts_fs[..]
+            } else {
+                &[]
+            };
+            for ce in counterparts {
+                locked_claimed.insert(dest_dir.join(format!("{}.{}", candidate_stem, ce)));
+            }
+
+            // If this is a valid Live Photo, remember the successful stem for the sibling's turn
             if let Some(key) = live_key {
                 locked_live_map.insert(key, candidate_stem.clone());
             }
             
-            let final_name = match ext {
-                Some(e) => format!("{}.{}", candidate_stem, e),
-                None => candidate_stem,
-            };
-            let full_dest = dest_dir.join(&final_name);
-            locked_claimed.insert(full_dest.clone());
             return full_dest;
         }
 
@@ -286,8 +314,8 @@ pub fn sort_files_to_folders(input_dir: &Path, output_dir: &Path, failed_guess_p
                 }
             }
 
-            // If an .MP4 component of a Live Photo is missing a date, borrow it from the image sibling
-            if date_str.is_empty() && ext == "mp4" {
+            // If an .MP4 or .MOV component of a Live Photo is missing a date, borrow it from the image sibling
+            if date_str.is_empty() && (ext == "mp4" || ext == "mov") {
                 let mut sibling = None;
                 for e in &["heic", "HEIC", "jpg", "JPG", "jpeg", "JPEG"] {
                     let p = path.with_extension(e);
