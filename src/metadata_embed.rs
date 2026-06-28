@@ -81,6 +81,8 @@ pub fn embed_metadata_all(metadata_list: &[MediaMetadata], log_dir: &Path) {
             meta.media_path.file_name().unwrap_or_default(), used, date_to_embed, meta.gps_latitude, meta.gps_longitude, meta.gps_altitude, meta.camera_make, meta.camera_model
         );
         
+        args.push("-m".to_string()); // Ignore minor warnings
+
         let mut retry_needed = false;
         let mut new_media_path = meta.media_path.clone();
 
