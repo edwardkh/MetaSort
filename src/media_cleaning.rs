@@ -167,32 +167,63 @@ pub fn clean_json_filenames(base_path: &str) {
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let parent = path.parent().unwrap_or(Path::new(""));
         
-        if let Ok(entries) = fs::read_dir(parent) {
-            for json_entry in entries.flatten() {
-                let json_path = json_entry.path();
+        let expected_name = format!("{}.json", filename);
+        let expected_path = parent.join(&expected_name);
+
+        // If the perfectly named JSON doesn't exist, hunt for it
+        if !expected_path.exists() {
+            let mut found_json = None;
+            
+            if let Ok(entries) = fs::read_dir(parent) {
+                let entries_list: Vec<_> = entries.flatten().collect();
                 
-                if json_path.is_file() {
-                    if let Some(json_name) = json_path.file_name().and_then(|n| n.to_str()) {
-                        let expected_name = format!("{}.json", filename);
-                        
-                        // Check if the file is a loosely matched JSON that needs renaming
-                        if json_name.starts_with(filename) && json_name.ends_with(".json") && json_name != expected_name {
-                            let new_json_path = parent.join(&expected_name);
-                            
-                            // Lock the log mutex just before writing
-                            let mut log = log_mutex.lock().unwrap();
-                            if let Err(e) = fs::rename(&json_path, &new_json_path) {
-                                let _ = log.write_all(format!("❌ Failed to rename {:?} to {:?}: {}\n", json_path, new_json_path, e).as_bytes());
-                            } else {
-                                let _ = log.write_all(format!("✅ Renamed JSON {:?} to {:?}\n", json_path, new_json_path).as_bytes());
+                // Pattern 1: The Google Photos Duplicate Anomaly
+                // Handles: "123_1(1).jpeg" -> "123_1.jpeg.supplemental-metadata(1).json"
+                let re = Regex::new(r"^(.*?)\((\d+)\)\.([a-zA-Z0-9]+)$").unwrap();
+                if let Some(caps) = re.captures(filename) {
+                    let base_name = &caps[1];
+                    let copy_num = &caps[2];
+                    let ext = &caps[3];
+                    
+                    let search_prefix = format!("{}.{}", base_name, ext); // e.g., "123_1.jpeg"
+                    let search_suffix = format!("({}).json", copy_num);   // e.g., "(1).json"
+                    
+                    for entry in &entries_list {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.starts_with(&search_prefix) && name.ends_with(&search_suffix) {
+                                found_json = Some(entry.path());
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Pattern 2: Standard loose prefix fallback
+                // Handles: "IMG_123.jpg" -> "IMG_123.jpg.json"
+                if found_json.is_none() {
+                    let prefix = format!("{}.", filename);
+                    for entry in &entries_list {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.starts_with(&prefix) && name.ends_with(".json") && name != &expected_name {
+                                found_json = Some(entry.path());
+                                break;
                             }
                         }
                     }
                 }
             }
+
+            // If we found a mismatched JSON using either pattern, rename it to the expected standard
+            if let Some(quirky_json_path) = found_json {
+                let mut log = log_mutex.lock().unwrap();
+                if let Err(e) = fs::rename(&quirky_json_path, &expected_path) {
+                    let _ = log.write_all(format!("❌ Failed to rename {:?} to {:?}: {}\n", quirky_json_path, expected_path, e).as_bytes());
+                } else {
+                    let _ = log.write_all(format!("✅ Renamed JSON {:?} to {:?}\n", quirky_json_path, expected_path).as_bytes());
+                }
+            }
         }
     });
-
     let summary = "\n🧹 JSON filename cleaning complete.\n";
     let mut log = log_mutex.lock().unwrap();
     let _ = log.write_all(summary.as_bytes());
