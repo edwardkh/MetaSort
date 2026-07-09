@@ -12,7 +12,7 @@
 
 <div align="center">
   <img src="assets/logo.png" alt="MetaSort Logo" width="120"/>
-  <h1>MetaSort v1.0.0</h1>
+  <h1>MetaSort v1.1.0</h1>
   <h3>🚀 Google Photos Takeout Organizer</h3>
   <p><em>Transform your messy Google Photos Takeout into beautifully organized media libraries!</em></p>
 </div>
@@ -31,6 +31,9 @@
 - 💬 **Separates WhatsApp & Screenshots** (optional)
 - 📊 **Generates beautiful reports** (CSV + HTML)
 - 🎨 **Beautiful UI** with progress bars and emoji-rich feedback
+- ⚡ **Multithreaded processing** for blazing-fast performance via Rayon
+- 📱 **iOS Live Photo pairing** — keeps .HEIC/.JPG + .MP4/.MOV pairs together
+- 🔗 **Cross-media extension claiming** — proactively reserves paired filenames to prevent collisions
 
 ---
 
@@ -111,7 +114,7 @@ cargo run --release
 ## 📋 Requirements
 
 ### System Requirements:
-- **macOS 10.13+** or **Windows 10+**
+- **macOS 10.13+**, **Windows 10+**, or **Linux**
 - **4GB RAM** (recommended)
 - **500MB free space** for the application
 
@@ -248,8 +251,15 @@ MetaSort_Output/
 ### Metadata Sources:
 - **JSON files** (Google Photos metadata)
 - **Filename patterns** (WhatsApp, Screenshots, etc.)
-- **EXIF data** (embedded in files)
+- **EXIF data** (embedded in files — `EXIF:DateTimeOriginal` set on all supported formats)
 - **File timestamps** (fallback)
+
+### iOS Live Photo Pairing:
+MetaSort intelligently detects iOS Live Photo pairs (`.HEIC`/`.JPG`/`.JPEG` + `.MP4`/`.MOV`) and ensures:
+- Both components are sorted into the **same destination folder**
+- Both receive the **same base filename** if a naming collision occurs
+- The video component is never orphaned into the "Unknown Time" folder
+- Cross-media extensions are proactively claimed to prevent collisions from other years
 
 ---
 
@@ -279,6 +289,13 @@ MetaSort can extract dates from countless filename patterns:
 
 ## 🛠️ Advanced Features
 
+### ⚡ Multithreaded Processing
+MetaSort uses [Rayon](https://github.com/rayon-rs/rayon) for parallel processing, enabling:
+- **Parallel file cleaning** — JSON filename cleanup runs across all CPU cores
+- **Parallel metadata embedding** — ExifTool operations run concurrently
+- **Parallel file sorting** — folder creation and file moves are parallelized
+- Automatic thread-pool sizing based on available CPU cores
+
 ### 🔧 Command Line Options
 ```bash
 # Run with specific options
@@ -300,6 +317,11 @@ cargo run --release -- --output "/path/to/output"
 - Process multiple folders
 - Resume interrupted operations
 - Skip already processed files
+
+### 🛡️ Robust ExifTool Integration
+- Minor ExifTool warnings are automatically suppressed to prevent false failures
+- `EXIF:DateTimeOriginal` is set on **all** supported file formats (not just photos)
+- Graceful error handling for unsupported or corrupted files
 
 ---
 
@@ -353,13 +375,13 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 MetaSort/
 ├── 📁 src/                    # Source code
-│   ├── main.rs               # Main application
+│   ├── main.rs               # Main application & multithreaded orchestration
 │   ├── platform.rs           # Cross-platform compatibility
 │   ├── ui.rs                 # User interface & progress bars
-│   ├── media_cleaning.rs     # File cleaning & organization
+│   ├── media_cleaning.rs     # File cleaning & organization (multithreaded)
 │   ├── metadata_extraction.rs # JSON metadata extraction
-│   ├── metadata_embed.rs     # Metadata embedding
-│   ├── sort_to_folders.rs    # File sorting & folder creation
+│   ├── metadata_embed.rs     # Metadata embedding (EXIF:DateTimeOriginal)
+│   ├── sort_to_folders.rs    # File sorting, folder creation & Live Photo pairing
 │   ├── csv_report.rs         # CSV report generation
 │   ├── html_report.rs        # HTML report generation
 │   ├── filename_date_guess.rs # Date extraction from filenames
@@ -379,7 +401,7 @@ MetaSort/
 ├── 🚀 MetaSort.command       # Advanced launcher (macOS)
 ├── 📄 README.md              # This file
 ├── 📄 LICENSE.txt            # Apache 2.0 License
-└── 📄 Cargo.toml             # Rust project configuration
+└── 📄 Cargo.toml             # Rust project configuration (includes rayon)
 ```
 
 ---
@@ -431,9 +453,24 @@ This means you can:
 ## 🏆 Acknowledgments
 
 - **ExifTool** - For powerful metadata handling
+- **Rayon** - For effortless data parallelism in Rust
 - **Rust Community** - For the amazing ecosystem
 - **All Contributors** - For making MetaSort better
 - **You** - For using and supporting MetaSort!
+
+---
+
+## 📝 Changelog (since v1.0.0)
+
+### v1.1.0 — Performance & Live Photo Improvements
+- ⚡ **Multithreading**: Added Rayon-based parallel processing for file cleaning, metadata embedding, and sorting
+- 📱 **iOS Live Photo pairing**: `.HEIC`/`.JPG`/`.JPEG` + `.MP4`/`.MOV` pairs are kept together during sorting
+- 🔗 **Cross-media extension claiming**: Proactively reserves paired filenames to prevent collisions across years
+- 🏷️ **Universal EXIF:DateTimeOriginal**: All supported file formats now receive `EXIF:DateTimeOriginal` metadata
+- 🛡️ **ExifTool robustness**: Minor warnings are now suppressed to prevent false failures
+- 📁 **Unknown timestamp folder**: Re-added fallback folder for files with no determinable date
+- 🔧 **Filename collision fix**: `.HEIC` and `.MP4` components from the same source folder receive identical base filenames on collision
+- 🧹 **Multithreaded JSON cleanup**: `clean_json_filenames` now runs in parallel for faster processing
 
 ---
 
