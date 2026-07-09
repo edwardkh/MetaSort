@@ -57,7 +57,7 @@
 ### For Developers:
 ```bash
 # Clone and build
-git clone https://github.com/iamsanmith/MetaSort.git
+git clone https://github.com/edwardkh/MetaSort.git
 cd MetaSort
 cargo build --release
 cargo run --release
@@ -133,7 +133,7 @@ cargo run --release
 #### Option 1: Automated (Recommended)
 ```bash
 # Download and extract MetaSort
-git clone https://github.com/iamsanmith/MetaSort.git
+git clone hhttps://github.com/edwardkh/MetaSort.git
 cd MetaSort
 
 # Build and create launchers
@@ -153,7 +153,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 brew install exiftool
 
 # 4. Build MetaSort
-git clone https://github.com/iamsanmith/MetaSort.git
+git clone hhttps://github.com/edwardkh/MetaSort.git
 cd MetaSort
 cargo build --release
 ```
@@ -177,7 +177,7 @@ scripts/install_windows.bat
 winget install ExifTool.ExifTool
 
 # 3. Build MetaSort
-git clone https://github.com/iamsanmith/MetaSort.git
+git clone hhttps://github.com/edwardkh/MetaSort.git
 cd MetaSort
 cargo build --release
 ```
